@@ -12,8 +12,9 @@ import CarbKit
 import HealthKit
 import InsulinKit
 import LoopKit
+import RileyLinkKit
 
-class NightscoutDataManager {
+final class NightscoutDataManager {
 
     unowned let deviceDataManager: DeviceDataManager
     
@@ -28,20 +29,21 @@ class NightscoutDataManager {
     
     @objc func loopDataUpdated(_ note: Notification) {
         guard
+            deviceDataManager.remoteDataManager.nightscoutService.uploader != nil,
             let rawContext = note.userInfo?[LoopDataManager.LoopUpdateContextKey] as? LoopDataManager.LoopUpdateContext.RawValue,
             let context = LoopDataManager.LoopUpdateContext(rawValue: rawContext),
             case .tempBasal = context
-            else {
+        else {
                 return
         }
 
         deviceDataManager.loopManager.getLoopStatus { (predictedGlucose, _, recommendedTempBasal, lastTempBasal, _, insulinOnBoard, carbsOnBoard, loopError) in
             
-            self.deviceDataManager.loopManager.getRecommendedBolus { (bolusUnits, getBolusError) in
+            self.deviceDataManager.loopManager.getRecommendedBolus { (recommendation, getBolusError) in
                 if let getBolusError = getBolusError {
                     self.deviceDataManager.logger.addError(getBolusError, fromSource: "NightscoutDataManager")
                 }
-                self.uploadLoopStatus(insulinOnBoard, carbsOnBoard: carbsOnBoard, predictedGlucose: predictedGlucose, recommendedTempBasal: recommendedTempBasal, recommendedBolus: bolusUnits, lastTempBasal: lastTempBasal, loopError: loopError ?? getBolusError)
+                self.uploadLoopStatus(insulinOnBoard, carbsOnBoard: carbsOnBoard, predictedGlucose: predictedGlucose, recommendedTempBasal: recommendedTempBasal, recommendedBolus: recommendation?.amount, lastTempBasal: lastTempBasal, loopError: loopError ?? getBolusError)
             }
         }
     }
@@ -50,7 +52,7 @@ class NightscoutDataManager {
 
     func uploadLoopStatus(_ insulinOnBoard: InsulinValue? = nil, carbsOnBoard: CarbValue? = nil, predictedGlucose: [GlucoseValue]? = nil, recommendedTempBasal: LoopDataManager.TempBasalRecommendation? = nil, recommendedBolus: Double? = nil, lastTempBasal: DoseEntry? = nil, loopError: Error? = nil) {
 
-        guard deviceDataManager.remoteDataManager.nightscoutUploader != nil else {
+        guard deviceDataManager.remoteDataManager.nightscoutService.uploader != nil else {
             return
         }
         
@@ -108,7 +110,7 @@ class NightscoutDataManager {
 
     }
     
-    func getUploaderStatus() -> UploaderStatus {
+    private func getUploaderStatus() -> UploaderStatus {
         // Gather UploaderStatus
         let uploaderDevice = UIDevice.current
 
@@ -121,9 +123,9 @@ class NightscoutDataManager {
         return UploaderStatus(name: uploaderDevice.name, timestamp: Date(), battery: battery)
     }
 
-    func uploadDeviceStatus(_ pumpStatus: NightscoutUploadKit.PumpStatus? = nil, loopStatus: LoopStatus? = nil, includeUploaderStatus: Bool = true) {
+    func uploadDeviceStatus(_ pumpStatus: NightscoutUploadKit.PumpStatus? = nil, loopStatus: LoopStatus? = nil, rileylinkDevice: RileyLinkKit.RileyLinkDevice? = nil, includeUploaderStatus: Bool = true) {
 
-        guard let uploader = deviceDataManager.remoteDataManager.nightscoutUploader else {
+        guard let uploader = deviceDataManager.remoteDataManager.nightscoutService.uploader else {
             return
         }
         
@@ -138,8 +140,14 @@ class NightscoutDataManager {
 
         let uploaderStatus: UploaderStatus? = includeUploaderStatus ? getUploaderStatus() : nil
 
+        var radioAdapter: NightscoutUploadKit.RadioAdapter? = nil
+
+        if let device = rileylinkDevice {
+            radioAdapter = NightscoutUploadKit.RadioAdapter(hardware: "RileyLink", frequency: device.radioFrequency, name: device.name ?? "Unknown", lastTuned: device.lastTuned, firmwareVersion: device.firmwareVersion ?? "Unknown", RSSI: device.RSSI, pumpRSSI: device.pumpRSSI)
+        }
+
         // Build DeviceStatus
-        let deviceStatus = DeviceStatus(device: "loop://\(uploaderDevice.name)", timestamp: Date(), pumpStatus: pumpStatus, uploaderStatus: uploaderStatus, loopStatus: loopStatus)
+        let deviceStatus = DeviceStatus(device: "loop://\(uploaderDevice.name)", timestamp: Date(), pumpStatus: pumpStatus, uploaderStatus: uploaderStatus, loopStatus: loopStatus, radioAdapter: radioAdapter)
 
         self.lastDeviceStatusUpload = Date()
         uploader.uploadDeviceStatus(deviceStatus)

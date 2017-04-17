@@ -9,6 +9,7 @@
 import UIKit
 import HealthKit
 import LoopKit
+import LoopUI
 
 
 class PredictionTableViewController: UITableViewController, IdentifiableClass, UIGestureRecognizerDelegate {
@@ -88,7 +89,7 @@ class PredictionTableViewController: UITableViewController, IdentifiableClass, U
     var dataManager: DeviceDataManager!
 
     private lazy var charts: StatusChartsManager = {
-        let charts = StatusChartsManager()
+        let charts = StatusChartsManager(colors: .default, settings: .default)
 
         charts.glucoseDisplayRange = (
             min: HKQuantity(unit: HKUnit.milligramsPerDeciliterUnit(), doubleValue: 60),
@@ -129,59 +130,58 @@ class PredictionTableViewController: UITableViewController, IdentifiableClass, U
 
             let reloadGroup = DispatchGroup()
 
-            if let glucoseStore = dataManager.glucoseStore {
+            reloadGroup.enter()
+
+            dataManager.loopManager.glucoseStore.preferredUnit { (unit, error) in
+                if let unit = unit {
+                    self.charts.glucoseUnit = unit
+                }
+
                 reloadGroup.enter()
-
-                glucoseStore.preferredUnit { (unit, error) in
-                    if let unit = unit {
-                        self.charts.glucoseUnit = unit
-                    }
-
-                    reloadGroup.enter()
-                    glucoseStore.getRecentGlucoseValues(startDate: self.charts.startDate) { (values, error) -> Void in
-                        if let error = error {
-                            self.dataManager.logger.addError(error, fromSource: "GlucoseStore")
-                            self.needsRefresh = true
-                            // TODO: Display error in the cell
-                        } else {
-                            self.charts.glucoseValues = values
-                        }
-
-                        reloadGroup.leave()
-                    }
-
-                    reloadGroup.enter()
-                    self.dataManager.loopManager.getLoopStatus { (predictedGlucose, retrospectivePredictedGlucose, _, _, _, _, _, error) in
-                        if error != nil {
-                            self.needsRefresh = true
-                        }
-
-                        self.retrospectivePredictedGlucose = retrospectivePredictedGlucose
-                        self.charts.predictedGlucoseValues = predictedGlucose ?? []
-                        
-                        reloadGroup.leave()
-                    }
-
-                    reloadGroup.enter()
-                    self.dataManager.loopManager.modelPredictedGlucose(using: self.selectedInputs.flatMap { $0.selected ? $0.input : nil }) { (predictedGlucose, error) in
-                        if error != nil {
-                            self.needsRefresh = true
-                        }
-
-                        self.charts.alternatePredictedGlucoseValues = predictedGlucose ?? []
-
-                        if let lastPoint = self.charts.alternatePredictedGlucosePoints?.last?.y {
-                            self.eventualGlucoseDescription = String(describing: lastPoint)
-                        }
-
-                        reloadGroup.leave()
+                self.dataManager.loopManager.glucoseStore.getGlucoseValues(start: self.charts.startDate) { (result) -> Void in
+                    switch result {
+                    case .failure(let error):
+                        self.dataManager.logger.addError(error, fromSource: "GlucoseStore")
+                        self.needsRefresh = true
+                        self.charts.setGlucoseValues([])
+                    case .success(let values):
+                        self.charts.setGlucoseValues(values)
                     }
 
                     reloadGroup.leave()
                 }
+
+                reloadGroup.enter()
+                self.dataManager.loopManager.getLoopStatus { (predictedGlucose, retrospectivePredictedGlucose, _, _, _, _, _, error) in
+                    if error != nil {
+                        self.needsRefresh = true
+                    }
+
+                    self.retrospectivePredictedGlucose = retrospectivePredictedGlucose
+                    self.charts.setPredictedGlucoseValues(predictedGlucose ?? [])
+                    
+                    reloadGroup.leave()
+                }
+
+                reloadGroup.enter()
+                self.dataManager.loopManager.modelPredictedGlucose(using: self.selectedInputs.flatMap { $0.selected ? $0.input : nil }) { (predictedGlucose, error) in
+                    if error != nil {
+                        self.needsRefresh = true
+                    }
+
+                    self.charts.setAlternatePredictedGlucoseValues(predictedGlucose ?? [])
+
+                    if let lastPoint = self.charts.alternatePredictedGlucosePoints?.last?.y {
+                        self.eventualGlucoseDescription = String(describing: lastPoint)
+                    }
+
+                    reloadGroup.leave()
+                }
+
+                reloadGroup.leave()
             }
 
-            charts.glucoseTargetRangeSchedule = dataManager.glucoseTargetRangeSchedule
+            charts.targetPointsCalculator = GlucoseRangeScheduleCalculator(dataManager.loopManager.settings.glucoseTargetRangeSchedule)
 
             reloadGroup.notify(queue: DispatchQueue.main) {
                 self.charts.prerender()
@@ -255,14 +255,14 @@ class PredictionTableViewController: UITableViewController, IdentifiableClass, U
 
             cell.titleLabel?.text = input.localizedTitle
             cell.accessoryType = selected ? .checkmark : .none
-            cell.enabled = input != .retrospection || dataManager.loopManager.retrospectiveCorrectionEnabled
+            cell.enabled = input != .retrospection || dataManager.loopManager.settings.retrospectiveCorrectionEnabled
 
             var subtitleText = input.localizedDescription(forGlucoseUnit: charts.glucoseUnit)
 
             if input == .retrospection,
                 let startGlucose = retrospectivePredictedGlucose?.first,
                 let endGlucose = retrospectivePredictedGlucose?.last,
-                let currentGlucose = self.dataManager.glucoseStore?.latestGlucose
+                let currentGlucose = self.dataManager.loopManager.glucoseStore.latestGlucose
             {
                 let formatter = NumberFormatter.glucoseFormatter(for: charts.glucoseUnit)
                 let values = [startGlucose, endGlucose, currentGlucose].map { formatter.string(from: NSNumber(value: $0.quantity.doubleValue(for: charts.glucoseUnit))) ?? "?" }
@@ -285,7 +285,7 @@ class PredictionTableViewController: UITableViewController, IdentifiableClass, U
 
             cell.titleLabel?.text = NSLocalizedString("Enable Retrospective Correction", comment: "Title of the switch which toggles retrospective correction effects")
             cell.subtitleLabel?.text = NSLocalizedString("This will more aggresively increase or decrease basal delivery when glucose movement doesn't match the carbohydrate and insulin-based model.", comment: "The description of the switch which toggles retrospective correction effects")
-            cell.`switch`?.isOn = dataManager.loopManager.retrospectiveCorrectionEnabled
+            cell.`switch`?.isOn = dataManager.loopManager.settings.retrospectiveCorrectionEnabled
             cell.`switch`?.addTarget(self, action: #selector(retrospectiveCorrectionSwitchChanged(_:)), for: .valueChanged)
 
             cell.contentView.layoutMargins.left = tableView.separatorInset.left
@@ -369,12 +369,12 @@ class PredictionTableViewController: UITableViewController, IdentifiableClass, U
     // MARK: - Actions
 
     @objc private func retrospectiveCorrectionSwitchChanged(_ sender: UISwitch) {
-        dataManager.loopManager.retrospectiveCorrectionEnabled = sender.isOn
+        dataManager.loopManager.settings.retrospectiveCorrectionEnabled = sender.isOn
 
         if  let row = selectedInputs.index(where: { $0.input == PredictionInputEffect.retrospection }),
             let cell = tableView.cellForRow(at: IndexPath(row: row, section: Section.inputs.rawValue)) as? PredictionInputEffectTableViewCell
         {
-            cell.enabled = self.dataManager.loopManager.retrospectiveCorrectionEnabled
+            cell.enabled = self.dataManager.loopManager.settings.retrospectiveCorrectionEnabled
         }
     }
 }
